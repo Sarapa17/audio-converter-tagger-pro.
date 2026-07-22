@@ -138,10 +138,12 @@ La función `perform_spectral_analysis` en [`app.py`](app.py) hace lo siguiente:
 
 ## Licencia
 
-Uso libre. Si subís el proyecto a GitHub y querés una licencia formal, podés agregar `MIT` u otra.
+Este proyecto está bajo la **Licencia MIT**. Ver el archivo [LICENSE](LICENSE) para más detalles.
 
----
+Resumen práctico: podés usarlo, copiarlo, modificarlo y distribuirlo libremente —incluido uso comercial— siempre que conserves el aviso de copyright y la nota de licencia. Sin garantías de ningún tipo.
 
 ## Autor
 
-Tomas
+**Tomas Sarapura** — [@Sarapa17](https://github.com/Sarapa17)
+
+Repositorio: <https://github.com/Sarapa17/audio-converter-tagger-pro>
