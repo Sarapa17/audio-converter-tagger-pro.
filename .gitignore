@@ -1,0 +1,80 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtualenv ---
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+pyvenv.cfg
+
+# --- PyInstaller ---
+*.spec.bak
+build/
+dist/
+
+# --- Binarios externos (ffmpeg no se sube al repo, ~80MB) ---
+ffmpeg
+ffmpeg.exe
+ffprobe
+ffprobe.exe
+*.app/
+*.app
+*.exe
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+# Icon shortcuts en macOS (carpetas)
+Icon
+
+# --- IDE / Editores ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# --- Logs / temporales ---
+*.log
+*.tmp
+*.bak
+tmp/
+
+# --- Datos de prueba / output ---
+output/
+*.mp3
+*.m4a
+*.flac
+*.wav
+!requirements.txt
