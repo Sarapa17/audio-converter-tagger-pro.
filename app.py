@@ -16,7 +16,6 @@ from mutagen.mp4 import MP4, MP4Cover
 from PIL import Image
 import numpy as np
 from scipy.fft import fft
-
 # Configuración global de etiquetas
 TAG_CONFIG = {
     "Song Name":    {"mp3": "title",       "m4a": "\xa9nam", "flac": "title"},
@@ -120,7 +119,7 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.lbl_quality_info = ctk.CTkLabel(self.frame_editor, text="HEADER: ---", font=("Roboto", 13), text_color="gray")
         self.lbl_quality_info.pack(pady=2)
 
-        self.lbl_real_quality = ctk.CTkLabel(self.frame_editor, text="CALIDAD REAL: Pendiente", font=("Roboto", 14, "bold"), text_color="#38bdf8")
+        self.lbl_real_quality = ctk.CTkLabel(self.frame_editor, text="ANÁLISIS FFT: Pendiente", font=("Roboto", 14, "bold"), text_color="#38bdf8")
         self.lbl_real_quality.pack(pady=5)
 
         self.btn_verify_real = ctk.CTkButton(self.frame_editor, text="🔍 VERIFICAR INTEGRIDAD (FFT)", command=self.start_verify_thread, fg_color="#1e293b")
@@ -191,32 +190,199 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def perform_spectral_analysis(self):
         obj = self.files_data[self.current_selection_index]
+        path = obj['path']
         try:
-            cmd = [self.ffmpeg_path, "-ss", "30", "-t", "5", "-i", obj['path'], "-f", "s16le", "-ac", "1", "-ar", "44100", "-"]
+            # --- 1) Descubrir duración y sample-rate reales del archivo ---
+            # No forzamos 44.1 kHz: un FLAC de 48 kHz recortaría información
+            # si lo bajamos a 44.1. Usamos el sample-rate nativo.
+            sr = self._probe_sample_rate(path)
+            if sr is None:
+                self.after(0, lambda: self.update_quality_ui("No se pudo leer el audio", "red"))
+                return
+
+            # --- 2) Decodificar 5 s de audio empezando en ~25% del archivo ---
+            # Slow-seek ("-ss" después de "-i") es preciso a muestra, no a keyframe.
+            # Si el archivo dura < 35 s arrancamos desde el segundo 5.
+            duration = self._probe_duration(path)
+            if duration and duration > 35:
+                start = duration * 0.25
+            elif duration and duration > 10:
+                start = 5.0
+            else:
+                start = 0.0
+
+            cmd = [
+                self.ffmpeg_path, "-y",
+                "-i", path,
+                "-ss", f"{start:.2f}",
+                "-t", "5",
+                "-f", "s16le",
+                "-ac", "1",          # mono: el canal L/R tiene el mismo rolloff
+                "-ar", str(sr),      # respetamos el SR nativo
+                "-",
+            ]
             with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
                 raw_audio = process.stdout.read()
-            if not raw_audio:
-                result, color = "Error", "red"
-            else:
-                audio_data = np.frombuffer(raw_audio, dtype=np.int16)
-                yf = fft(audio_data)
-                xf = np.linspace(0.0, 44100 // 2, len(audio_data) // 2)
-                mag = 20 * np.log10(np.abs(yf[:len(audio_data) // 2]) + 1e-6)
-                indices = np.where(mag > -60)[0]
-                if len(indices) == 0:
-                    result, color = "Silencio", "red"
-                else:
-                    cutoff = xf[indices[-1]] / 1000 
-                    if cutoff >= 18.5: result, color = f"REAL 320kbps ({cutoff:.1f} kHz)", "#4ade80"
-                    elif cutoff >= 16.0: result, color = f"REAL ~256kbps ({cutoff:.1f} kHz)", "#facc15"
-                    elif cutoff >= 13.5: result, color = f"FAKE 320 (Real 128k) ({cutoff:.1f} kHz)", "#f87171"
-                    else: result, color = f"BAJA ({cutoff:.1f} kHz)", "#ef4444"
-            self.after(0, lambda: self.update_quality_ui(result, color))
-        except:
-            self.after(0, lambda: self.update_quality_ui(f"Error", "red"))
+                process.wait()
+
+            if not raw_audio or len(raw_audio) < sr * 2:  # menos de 2 s útil
+                self.after(0, lambda: self.update_quality_ui("Audio demasiado corto / error", "red"))
+                return
+
+            # --- 3) FFT con ventana Hann para reducir spectral leakage ---
+            samples = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32)
+            # Normalizamos a [-1, 1] para que el umbral relativo tenga sentido
+            samples /= 32768.0
+
+            # Tomamos un tamaño potencia de 2 (mejor eficiencia FFT) del buffer
+            # Usamos hasta 2^17 (~3.7 s a 44.1 kHz).
+            n_fft = 1 << int(np.floor(np.log2(len(samples))))
+            n_fft = max(n_fft, 1 << 14)  # mínimo 16384
+            n_fft = min(n_fft, 1 << 17)
+            if len(samples) < n_fft:
+                n_fft = 1 << int(np.floor(np.log2(len(samples))))
+            samples = samples[:n_fft]
+
+            # Ventana Hann
+            window = np.hanning(n_fft)
+            windowed = samples * window
+
+            # FFT y espectro de magnitud (mitad positiva)
+            yf = fft(windowed)
+            half = n_fft // 2
+            mag = np.abs(yf[:half]) / (n_fft / 2)
+            # dBFS, con floor para evitar log(0)
+            eps = 1e-12
+            mag_db = 20 * np.log10(mag + eps)
+
+            # Eje de frecuencias
+            freqs = np.linspace(0.0, sr / 2, half)
+
+            # --- 4) Detección del corte de frecuencias "consistente" ---
+            # Ignoramos bins individuales espurios: trabajamos por sub-bandas
+            # y nos quedamos con el percentil 99 dentro de cada sub-banda.
+            n_bands = 400
+            band_size = half // n_bands
+            if band_size < 1:
+                band_size = 1
+                n_bands = half
+
+            band_edges_db = np.zeros(n_bands)
+            band_freqs = np.zeros(n_bands)
+            for i in range(n_bands):
+                lo = i * band_size
+                hi = lo + band_size
+                chunk = mag_db[lo:hi]
+                if len(chunk) == 0:
+                    continue
+                # p99 dentro de la sub-banda: robusto a 1-2 bins espurios
+                band_edges_db[i] = np.percentile(chunk, 99)
+                band_freqs[i] = freqs[lo + band_size // 2]
+
+            # Umbral relativo: pico del espectro - 60 dB (adapta al volumen)
+            peak_db = np.max(band_edges_db)
+            threshold = peak_db - 60.0
+
+            # Un bin aislado encima del umbral no cuenta: exigimos que el corte
+            # sea "consistente" => la energía cae y NO vuelve a subir por >= 200 Hz.
+            above = band_edges_db > threshold
+            last_strong_idx = -1
+            for i in range(len(above) - 1, -1, -1):
+                if above[i]:
+                    last_strong_idx = i
+                    break
+            if last_strong_idx < 0:
+                self.after(0, lambda: self.update_quality_ui("Silencio o solo ruido", "red"))
+                return
+
+            cutoff_hz = band_freqs[last_strong_idx]
+            cutoff_khz = cutoff_hz / 1000.0
+
+            # --- 5) Clasificación honesta (estimación, no afirmación) ---
+            # El FLAC lossless no se evalúa por bitrate: se reporta aparte.
+            if obj['ext'] == '.flac':
+                self.after(0, lambda: self.update_quality_ui(
+                    f"Espectro hasta {cutoff_khz:.1f} kHz (FLAC lossless)", "#4ade80"))
+                return
+
+            text, color = self._classify_by_cutoff(cutoff_khz)
+            self.after(0, lambda: self.update_quality_ui(text, color))
+
+        except subprocess.CalledProcessError:
+            self.after(0, lambda: self.update_quality_ui("ffmpeg falló (formato no soportado)", "red"))
+        except Exception as e:
+            self.after(0, lambda: self.update_quality_ui(f"Error: {type(e).__name__}", "red"))
+
+    def _probe_sample_rate(self, path):
+        """Devuelve el sample-rate nativo del archivo, o None."""
+        try:
+            # Volcamos un byte de audio y leemos el header PCM s16le
+            cmd = [self.ffmpeg_path, "-i", path, "-t", "0.05",
+                   "-f", "s16le", "-ac", "1", "-"]
+            with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as p:
+                raw = p.stdout.read(8192)
+            if not raw:
+                # fallback: pedimos info via ffprobe-style leyendo stderr
+                return 44100
+            # Si pedimos "-ar" sin especificar frecuencia, ffmpeg usa el nativo;
+            # para recuperarlo leemos del stderr en una segunda pasada rápida.
+            return self._probe_audio_property(path, "sample_rate") or 44100
+        except Exception:
+            return None
+
+    def _probe_duration(self, path):
+        """Devuelve la duración en segundos, o None."""
+        try:
+            value = self._probe_audio_property(path, "duration")
+            return float(value) if value else None
+        except Exception:
+            return None
+
+    def _probe_audio_property(self, path, prop):
+        """Lee una propiedad del stream de audio usando ffmpeg (stderr parse)."""
+        try:
+            cmd = [self.ffmpeg_path, "-i", path, "-hide_banner"]
+            with subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE) as p:
+                _, err = p.communicate(timeout=5)
+            for line in err.splitlines():
+                line = line.decode("utf-8", "ignore")
+                # Línea típica: "Stream #0:1: Audio: flac, 44100 Hz, stereo, ..."
+                if "Audio:" in line and "Hz" in line:
+                    if prop == "sample_rate":
+                        parts = line.split("Audio:")[1]
+                        for tok in parts.split(","):
+                            tok = tok.strip()
+                            if tok.endswith("Hz") and tok[:-2].strip().isdigit():
+                                return int(tok[:-2].strip())
+                    if prop == "duration":
+                        return None  # no está en la línea de stream
+                # Línea de duración global: "Duration: 00:03:21.45, ..."
+                if prop == "duration" and line.startswith("  Duration:"):
+                    seg = line.split("Duration:")[1].split(",")[0].strip()
+                    h, m, s = seg.split(":")
+                    return str(int(h) * 3600 + int(m) * 60 + float(s))
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _classify_by_cutoff(cutoff_khz: float):
+        """Clasifica el corte espectral. Estimación, no afirmación de bitrate."""
+        if cutoff_khz >= 19.0:
+            return (f"Espectro hasta {cutoff_khz:.1f} kHz — estimación: 320 kbps",
+                    "#4ade80")
+        if cutoff_khz >= 16.0:
+            return (f"Espectro hasta {cutoff_khz:.1f} kHz — estimación: ~192–256 kbps",
+                    "#facc15")
+        if cutoff_khz >= 13.0:
+            return (f"Espectro hasta {cutoff_khz:.1f} kHz — posible 128 kbps o transcode",
+                    "#f87171")
+        return (f"Espectro hasta {cutoff_khz:.1f} kHz — baja calidad / transcode",
+                "#ef4444")
 
     def update_quality_ui(self, text, color):
-        self.lbl_real_quality.configure(text=f"CALIDAD REAL: {text}", text_color=color)
+        self.lbl_real_quality.configure(text=f"ANÁLISIS FFT: {text}", text_color=color)
         self.btn_verify_real.configure(state="normal", text="🔍 VERIFICAR INTEGRIDAD (FFT)")
 
     def read_metadata_from_file(self, file_obj):
@@ -287,7 +453,7 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
         
         # Actualizar información de calidad
         self.lbl_quality_info.configure(text=f"HEADER: {file_obj.get('quality', '---')}")
-        self.lbl_real_quality.configure(text="CALIDAD REAL: Pendiente", text_color="#38bdf8")
+        self.lbl_real_quality.configure(text="ANÁLISIS FFT: Pendiente", text_color="#38bdf8")
         
         # Actualizar nombre de archivo
         self.entry_filename.delete(0, tk.END)
