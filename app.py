@@ -6,6 +6,7 @@ import threading
 import io
 import tkinter as tk
 from tkinter import messagebox, filedialog
+from concurrent.futures import ThreadPoolExecutor
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 from mutagen.easyid3 import EasyID3
@@ -16,6 +17,12 @@ from mutagen.mp4 import MP4, MP4Cover
 from PIL import Image
 import numpy as np
 from scipy.fft import fft
+
+# Cuántos workers paralelos para análisis FFT y lectura de tags.
+# ffmpeg y mutagen sueltan el GIL: hay paralelismo real.
+_MAX_WORKERS = min(8, max(2, (os.cpu_count() or 4) - 1))
+_AUDIO_EXTS = {'.flac', '.wav', '.mp3', '.m4a'}
+
 # Configuración global de etiquetas
 TAG_CONFIG = {
     "Song Name":    {"mp3": "title",       "m4a": "\xa9nam", "flac": "title"},
@@ -532,36 +539,81 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
             item['widget'].configure(fg_color=["#3B8ED0", "#1f538d"] if item == file_obj else ["#dbdbdb", "#2b2b2b"])
 
     def register_file(self, path):
+        # Si es una carpeta, recorrerla recursivamente y agregar todos los audios.
+        if os.path.isdir(path):
+            return self._register_folder(path)
+
         ext = os.path.splitext(path)[1].lower()
-        if ext not in ['.flac', '.wav', '.mp3', '.m4a']: return -1
-        
+        if ext not in _AUDIO_EXTS: return -1
+
         # Verificar si ya existe
         for idx, f_data in enumerate(self.files_data):
             if f_data['path'] == path: return idx
-        
+
         # Crear nuevo objeto de archivo
         file_obj = {
-            "path": path, 
-            "filename": os.path.basename(path), 
-            "ext": ext, 
-            "status": "Ready", 
-            "tags": {}, 
-            "widget": None, 
-            "lbl_name": None, 
-            "lbl_status": None, 
-            "progress_bar": None, 
-            "lbl_fft": None, 
+            "path": path,
+            "filename": os.path.basename(path),
+            "ext": ext,
+            "status": "Cargando...",
+            "tags": {},
+            "widget": None,
+            "lbl_name": None,
+            "lbl_status": None,
+            "progress_bar": None,
+            "lbl_fft": None,
             "fft_result": None,
-            "cover_bytes": None, 
-            "new_cover_path": None, 
-            "delete_cover": False, 
+            "cover_bytes": None,
+            "new_cover_path": None,
+            "delete_cover": False,
             "ctk_thumb": None
         }
-        
+
         self.files_data.append(file_obj)
         self.add_file_to_ui(file_obj)
-        self.read_metadata_from_file(file_obj)
+        # Leer tags en background (no bloquea el mainloop).
+        self._schedule_metadata_read(file_obj)
         return len(self.files_data) - 1
+
+    def _register_folder(self, folder_path):
+        """Recorre una carpeta recursivamente y agrega todos los audios.
+        Devuelve el índice del último agregado (o -1)."""
+        last_idx = -1
+        for root, _dirs, files in os.walk(folder_path):
+            for name in sorted(files):
+                if os.path.splitext(name)[1].lower() in _AUDIO_EXTS:
+                    idx = self.register_file(os.path.join(root, name))
+                    if idx != -1: last_idx = idx
+        return last_idx
+
+    def _schedule_metadata_read(self, file_obj):
+        """Lee los metadatos (mutagen) en un worker thread.
+        Actualiza lbl_name/lbl_status/tags del file_obj con self.after."""
+        def worker():
+            try:
+                # Lee tags SIN tocar la UI; mutagen es thread-safe por archivo.
+                self.read_metadata_from_file(file_obj)
+            except Exception:
+                file_obj['tags'] = {}
+                file_obj['quality'] = "Error leyendo tags"
+            finally:
+                # Vuelve al thread principal para actualizar widgets.
+                def update_ui():
+                    if file_obj.get('lbl_status'):
+                        file_obj['lbl_status'].configure(text="Ready", text_color="orange")
+                        file_obj['status'] = "Ready"
+                    # Si el usuario ya tiene este archivo seleccionado, refresca el editor.
+                    if self.current_selection_index is not None and \
+                       self.current_selection_index < len(self.files_data) and \
+                       self.files_data[self.current_selection_index] is file_obj:
+                        self.load_to_editor(self.current_selection_index)
+                self.after(0, update_ui)
+
+        # Limitamos a _MAX_WORKERS lecturas simultáneas.
+        if not hasattr(self, "_meta_executor"):
+            self._meta_executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS,
+                                                     thread_name_prefix="meta")
+        self._meta_executor.submit(worker)
 
     def add_file_to_ui(self, file_obj):
         row = ctk.CTkFrame(self.scroll_frame)
