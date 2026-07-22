@@ -178,6 +178,16 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.lbl_output = ctk.CTkLabel(controls, text=f"Destino: {os.path.basename(self.output_folder)}")
         self.lbl_output.pack(side="left", padx=5)
         ctk.CTkButton(controls, text="Carpeta", width=80, command=self.change_output_folder).pack(side="left", padx=5)
+
+        # Botón de verificación FFT en lote + estado de progreso
+        self.lbl_batch_status = ctk.CTkLabel(controls, text="", text_color="gray",
+                                             font=("Roboto", 11))
+        self.lbl_batch_status.pack(side="right", padx=(0, 10))
+        self.btn_batch_verify = ctk.CTkButton(controls, text="🔍 VERIFICAR TODOS (FFT)",
+                                              width=190, fg_color="#1e293b",
+                                              command=self.start_batch_verify_thread)
+        self.btn_batch_verify.pack(side="right", padx=5)
+
         self.btn_convert = ctk.CTkButton(controls, text="PROCESAR TODO", fg_color="#1f6aa5", command=self.start_conversion_thread)
         self.btn_convert.pack(side="right", padx=5)
 
@@ -186,132 +196,177 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def start_verify_thread(self):
         if self.current_selection_index is None: return
         self.btn_verify_real.configure(state="disabled", text="Analizando...")
-        threading.Thread(target=self.perform_spectral_analysis, daemon=True).start()
-
-    def perform_spectral_analysis(self):
         obj = self.files_data[self.current_selection_index]
-        path = obj['path']
-        try:
-            # --- 1) Descubrir duración y sample-rate reales del archivo ---
-            # No forzamos 44.1 kHz: un FLAC de 48 kHz recortaría información
-            # si lo bajamos a 44.1. Usamos el sample-rate nativo.
-            sr = self._probe_sample_rate(path)
-            if sr is None:
-                self.after(0, lambda: self.update_quality_ui("No se pudo leer el audio", "red"))
-                return
+        def on_done(_obj, result):
+            text, color = result
+            # guardamos el resultado por si el usuario re-selecciona
+            _obj['fft_result'] = (text, color)
+            self.update_quality_ui(text, color)
+        self.analyze_file_thread(obj, on_done)
 
-            # --- 2) Decodificar 5 s de audio empezando en ~25% del archivo ---
-            # Slow-seek ("-ss" después de "-i") es preciso a muestra, no a keyframe.
-            # Si el archivo dura < 35 s arrancamos desde el segundo 5.
-            duration = self._probe_duration(path)
-            if duration and duration > 35:
-                start = duration * 0.25
-            elif duration and duration > 10:
-                start = 5.0
-            else:
-                start = 0.0
+    def start_batch_verify_thread(self):
+        """Verifica con FFT TODOS los archivos de la cola, secuencialmente
+        en un solo thread, actualizando cada fila con el resultado."""
+        if not self.files_data:
+            messagebox.showinfo("Cola vacía", "Arrastrá archivos a la cola primero.")
+            return
+        self.btn_batch_verify.configure(state="disabled", text="Analizando cola...")
+        self.lbl_batch_status.configure(text=f"0 / {len(self.files_data)}")
 
-            cmd = [
-                self.ffmpeg_path, "-y",
-                "-i", path,
-                "-ss", f"{start:.2f}",
-                "-t", "5",
-                "-f", "s16le",
-                "-ac", "1",          # mono: el canal L/R tiene el mismo rolloff
-                "-ar", str(sr),      # respetamos el SR nativo
-                "-",
-            ]
-            with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
-                raw_audio = process.stdout.read()
-                process.wait()
+        def worker():
+            total = len(self.files_data)
+            for i, obj in enumerate(self.files_data, start=1):
+                # estado "Analizando..." en la fila
+                self.after(0, lambda o=obj: o.get('lbl_fft') and o['lbl_fft'].configure(
+                    text="…", text_color="#38bdf8"))
+                try:
+                    result = self.perform_spectral_analysis(obj)
+                except subprocess.CalledProcessError:
+                    result = ("ffmpeg falló", "red")
+                except Exception as e:
+                    result = (f"Error: {type(e).__name__}", "red")
 
-            if not raw_audio or len(raw_audio) < sr * 2:  # menos de 2 s útil
-                self.after(0, lambda: self.update_quality_ui("Audio demasiado corto / error", "red"))
-                return
+                text, color = result
+                obj['fft_result'] = result
+                # actualizar etiqueta de la fila (versión corta para la celda)
+                short = self._short_fft_label(text)
+                self.after(0, lambda o=obj, s=short, c=color: o.get('lbl_fft') and
+                           o['lbl_fft'].configure(text=s, text_color=c))
 
-            # --- 3) FFT con ventana Hann para reducir spectral leakage ---
-            samples = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32)
-            # Normalizamos a [-1, 1] para que el umbral relativo tenga sentido
-            samples /= 32768.0
+                self.after(0, lambda n=i: self.lbl_batch_status.configure(text=f"{n} / {total}"))
+            self.after(0, lambda: self.btn_batch_verify.configure(
+                state="normal", text="🔍 VERIFICAR TODOS (FFT)"))
+            self.after(0, lambda: self.lbl_batch_status.configure(text="Lote OK"))
 
-            # Tomamos un tamaño potencia de 2 (mejor eficiencia FFT) del buffer
-            # Usamos hasta 2^17 (~3.7 s a 44.1 kHz).
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _short_fft_label(text):
+        """Versión corta del resultado FFT para la celda de la cola."""
+        if text.startswith("Espectro hasta"):
+            # "Espectro hasta 19.2 kHz — estimación: 320 kbps" -> "~19.2 kHz 320k"
+            try:
+                khz_part = text.split("hasta")[1].split("kHz")[0].strip()
+                if "320" in text: return f"~{khz_part}kHz 320k"
+                if "256" in text: return f"~{khz_part}kHz ~256k"
+                if "128" in text: return f"~{khz_part}kHz 128k/TC"
+                if "FLAC" in text: return f"~{khz_part}kHz LOSSLESS"
+                return f"~{khz_part}kHz BAJO"
+            except Exception:
+                return text
+        if text.startswith("Silencio"): return "Silencio"
+        if text.startswith("No se pudo"): return "Error"
+        return text[:24]
+
+    def perform_spectral_analysis(self, file_obj):
+        """Ejecuta la FFT sobre un file_obj y devuelve (texto, color).
+        No toca la UI: el caller actualiza via self.after(0, ...).
+        Lanza excepciones tipadas; el caller decide qué hacer."""
+        path = file_obj['path']
+        # --- 1) Sample-rate nativo (no forzamos 44.1 kHz) ---
+        sr = self._probe_sample_rate(path)
+        if sr is None:
+            return ("No se pudo leer el audio", "red")
+
+        # --- 2) Decodificar 5 s desde ~25% del archivo (slow-seek preciso) ---
+        duration = self._probe_duration(path)
+        if duration and duration > 35:
+            start = duration * 0.25
+        elif duration and duration > 10:
+            start = 5.0
+        else:
+            start = 0.0
+
+        cmd = [
+            self.ffmpeg_path, "-y",
+            "-i", path,
+            "-ss", f"{start:.2f}",
+            "-t", "5",
+            "-f", "s16le",
+            "-ac", "1",
+            "-ar", str(sr),
+            "-",
+        ]
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+            raw_audio = process.stdout.read()
+            process.wait()
+
+        if not raw_audio or len(raw_audio) < sr * 2:
+            return ("Audio demasiado corto / error", "red")
+
+        # --- 3) FFT con ventana Hann ---
+        samples = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32)
+        samples /= 32768.0
+
+        n_fft = 1 << int(np.floor(np.log2(len(samples))))
+        n_fft = max(n_fft, 1 << 14)
+        n_fft = min(n_fft, 1 << 17)
+        if len(samples) < n_fft:
             n_fft = 1 << int(np.floor(np.log2(len(samples))))
-            n_fft = max(n_fft, 1 << 14)  # mínimo 16384
-            n_fft = min(n_fft, 1 << 17)
-            if len(samples) < n_fft:
-                n_fft = 1 << int(np.floor(np.log2(len(samples))))
-            samples = samples[:n_fft]
+        samples = samples[:n_fft]
 
-            # Ventana Hann
-            window = np.hanning(n_fft)
-            windowed = samples * window
+        window = np.hanning(n_fft)
+        windowed = samples * window
 
-            # FFT y espectro de magnitud (mitad positiva)
-            yf = fft(windowed)
-            half = n_fft // 2
-            mag = np.abs(yf[:half]) / (n_fft / 2)
-            # dBFS, con floor para evitar log(0)
-            eps = 1e-12
-            mag_db = 20 * np.log10(mag + eps)
+        yf = fft(windowed)
+        half = n_fft // 2
+        mag = np.abs(yf[:half]) / (n_fft / 2)
+        eps = 1e-12
+        mag_db = 20 * np.log10(mag + eps)
 
-            # Eje de frecuencias
-            freqs = np.linspace(0.0, sr / 2, half)
+        freqs = np.linspace(0.0, sr / 2, half)
 
-            # --- 4) Detección del corte de frecuencias "consistente" ---
-            # Ignoramos bins individuales espurios: trabajamos por sub-bandas
-            # y nos quedamos con el percentil 99 dentro de cada sub-banda.
-            n_bands = 400
-            band_size = half // n_bands
-            if band_size < 1:
-                band_size = 1
-                n_bands = half
+        # --- 4) Corte por sub-bandas (p99 robusto a outliers) ---
+        n_bands = 400
+        band_size = half // n_bands
+        if band_size < 1:
+            band_size = 1
+            n_bands = half
 
-            band_edges_db = np.zeros(n_bands)
-            band_freqs = np.zeros(n_bands)
-            for i in range(n_bands):
-                lo = i * band_size
-                hi = lo + band_size
-                chunk = mag_db[lo:hi]
-                if len(chunk) == 0:
-                    continue
-                # p99 dentro de la sub-banda: robusto a 1-2 bins espurios
-                band_edges_db[i] = np.percentile(chunk, 99)
-                band_freqs[i] = freqs[lo + band_size // 2]
+        band_edges_db = np.zeros(n_bands)
+        band_freqs = np.zeros(n_bands)
+        for i in range(n_bands):
+            lo = i * band_size
+            hi = lo + band_size
+            chunk = mag_db[lo:hi]
+            if len(chunk) == 0:
+                continue
+            band_edges_db[i] = np.percentile(chunk, 99)
+            band_freqs[i] = freqs[lo + band_size // 2]
 
-            # Umbral relativo: pico del espectro - 60 dB (adapta al volumen)
-            peak_db = np.max(band_edges_db)
-            threshold = peak_db - 60.0
+        peak_db = np.max(band_edges_db)
+        threshold = peak_db - 60.0
 
-            # Un bin aislado encima del umbral no cuenta: exigimos que el corte
-            # sea "consistente" => la energía cae y NO vuelve a subir por >= 200 Hz.
-            above = band_edges_db > threshold
-            last_strong_idx = -1
-            for i in range(len(above) - 1, -1, -1):
-                if above[i]:
-                    last_strong_idx = i
-                    break
-            if last_strong_idx < 0:
-                self.after(0, lambda: self.update_quality_ui("Silencio o solo ruido", "red"))
-                return
+        above = band_edges_db > threshold
+        last_strong_idx = -1
+        for i in range(len(above) - 1, -1, -1):
+            if above[i]:
+                last_strong_idx = i
+                break
+        if last_strong_idx < 0:
+            return ("Silencio o solo ruido", "red")
 
-            cutoff_hz = band_freqs[last_strong_idx]
-            cutoff_khz = cutoff_hz / 1000.0
+        cutoff_hz = band_freqs[last_strong_idx]
+        cutoff_khz = cutoff_hz / 1000.0
 
-            # --- 5) Clasificación honesta (estimación, no afirmación) ---
-            # El FLAC lossless no se evalúa por bitrate: se reporta aparte.
-            if obj['ext'] == '.flac':
-                self.after(0, lambda: self.update_quality_ui(
-                    f"Espectro hasta {cutoff_khz:.1f} kHz (FLAC lossless)", "#4ade80"))
-                return
+        # --- 5) Clasificación honesta ---
+        if file_obj['ext'] == '.flac':
+            return (f"Espectro hasta {cutoff_khz:.1f} kHz (FLAC lossless)", "#4ade80")
+        text, color = self._classify_by_cutoff(cutoff_khz)
+        return (text, color)
 
-            text, color = self._classify_by_cutoff(cutoff_khz)
-            self.after(0, lambda: self.update_quality_ui(text, color))
-
-        except subprocess.CalledProcessError:
-            self.after(0, lambda: self.update_quality_ui("ffmpeg falló (formato no soportado)", "red"))
-        except Exception as e:
-            self.after(0, lambda: self.update_quality_ui(f"Error: {type(e).__name__}", "red"))
+    def analyze_file_thread(self, file_obj, on_done):
+        """Lanza un thread que analiza file_obj y llama a on_done(text, color)
+        en el thread principal. Reutilizable para análisis simple o por lote."""
+        def worker():
+            try:
+                result = self.perform_spectral_analysis(file_obj)
+            except subprocess.CalledProcessError:
+                result = ("ffmpeg falló (formato no soportado)", "red")
+            except Exception as e:
+                result = (f"Error: {type(e).__name__}", "red")
+            self.after(0, lambda: on_done(file_obj, result))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _probe_sample_rate(self, path):
         """Devuelve el sample-rate nativo del archivo, o None."""
@@ -453,7 +508,12 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
         
         # Actualizar información de calidad
         self.lbl_quality_info.configure(text=f"HEADER: {file_obj.get('quality', '---')}")
-        self.lbl_real_quality.configure(text="ANÁLISIS FFT: Pendiente", text_color="#38bdf8")
+        # Si ya fue analizado en lote, mostrar ese resultado; si no, pendiente
+        if file_obj.get('fft_result'):
+            text, color = file_obj['fft_result']
+            self.lbl_real_quality.configure(text=f"ANÁLISIS FFT: {text}", text_color=color)
+        else:
+            self.lbl_real_quality.configure(text="ANÁLISIS FFT: Pendiente", text_color="#38bdf8")
         
         # Actualizar nombre de archivo
         self.entry_filename.delete(0, tk.END)
@@ -490,6 +550,8 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
             "lbl_name": None, 
             "lbl_status": None, 
             "progress_bar": None, 
+            "lbl_fft": None, 
+            "fft_result": None,
             "cover_bytes": None, 
             "new_cover_path": None, 
             "delete_cover": False, 
@@ -514,16 +576,22 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
         progress = ctk.CTkProgressBar(row, width=80)
         progress.set(0)
         progress.pack(side="right", padx=10)
+
+        # Celda para mostrar el resultado del análisis FFT en lote
+        lbl_fft = ctk.CTkLabel(row, text="—", width=130, anchor="center",
+                               text_color="gray", font=("Roboto", 11))
+        lbl_fft.pack(side="right", padx=10)
         
         file_obj.update({
             'widget': row, 
             'lbl_name': lbl_name, 
             'lbl_status': lbl_status, 
-            'progress_bar': progress
+            'progress_bar': progress,
+            'lbl_fft': lbl_fft
         })
         
         # Hacer clicable toda la fila
-        for widget in [row, lbl_name, lbl_status]:
+        for widget in [row, lbl_name, lbl_status, lbl_fft]:
             widget.bind("<Button-1>", lambda e, obj=file_obj: self.manual_select(obj))
 
     def manual_select(self, file_obj):
