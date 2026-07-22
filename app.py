@@ -56,20 +56,41 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.current_selection_index = None
         self.output_folder = os.path.join(os.path.expanduser("~"), "Downloads")
         
-        # --- LAYOUT PRINCIPAL (2 COLUMNAS) ---
-        self.grid_columnconfigure(0, weight=4) 
-        self.grid_columnconfigure(1, weight=6) 
-        self.grid_rowconfigure(0, weight=1)
+        # --- LAYOUT PRINCIPAL: PanedWindow arrastrable (editor | cola) ---
+        # CustomTkinter no expone PanedWindow, usamos el de Tk estándar.
+        # sashwidth = grosor de la barra separadora arrastrable.
+        self.paned = tk.PanedWindow(
+            self,
+            orient="horizontal",
+            sashwidth=6,
+            sashrelief="flat",
+            bg="#1a1a1a",          # color de la barra separadora (dark)
+            borderwidth=0,
+            handlepad=0,
+        )
+        self.paned.pack(fill="both", expand=True)
 
         # Panel Izquierdo (Editor)
-        self.frame_editor = ctk.CTkFrame(self, corner_radius=0)
-        self.frame_editor.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        self.frame_editor = ctk.CTkFrame(self.paned, corner_radius=0)
+        self.paned.add(self.frame_editor, minsize=320, stretch="always")
         self.setup_editor_panel()
 
         # Panel Derecho (Conversor)
-        self.frame_converter = ctk.CTkFrame(self, corner_radius=0)
-        self.frame_converter.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
+        self.frame_converter = ctk.CTkFrame(self.paned, corner_radius=0)
+        self.paned.add(self.frame_converter, minsize=320, stretch="always")
         self.setup_converter_panel()
+
+        # Reparto inicial ~40/60 (mismo que el grid viejo)
+        self.after(50, self._set_initial_sash)
+
+    def _set_initial_sash(self):
+        """Coloca el separador en ~40% del ancho de la ventana al arrancar."""
+        try:
+            w = self.winfo_width()
+            if w > 100:
+                self.paned.sash_place(0, int(w * 0.40), 0)
+        except Exception:
+            pass
 
     def find_ffmpeg(self):
         """Busca ffmpeg en el sistema o junto a la app (Modo Portable)"""
