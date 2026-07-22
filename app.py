@@ -233,40 +233,83 @@ class AudioApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.analyze_file_thread(obj, on_done)
 
     def start_batch_verify_thread(self):
-        """Verifica con FFT TODOS los archivos de la cola, secuencialmente
-        en un solo thread, actualizando cada fila con el resultado."""
+        """Verifica con FFT TODOS los archivos de la cola, EN PARALELO
+        usando un ThreadPoolExecutor. Cada worker decodifica con ffmpeg
+        y hace la FFT de forma independiente (GIL se libera en numpy/subprocess).
+        Las actualizaciones de UI seDispatchan al thread principal con self.after."""
         if not self.files_data:
             messagebox.showinfo("Cola vacía", "Arrastrá archivos a la cola primero.")
             return
+        # Evitar lanzar dos lotes a la vez
+        if getattr(self, "_batch_running", False):
+            return
+        self._batch_running = True
+
+        items = list(self.files_data)  # snapshot, por si agregan más durante el lote
+        total = len(items)
         self.btn_batch_verify.configure(state="disabled", text="Analizando cola...")
-        self.lbl_batch_status.configure(text=f"0 / {len(self.files_data)}")
+        self.lbl_batch_status.configure(text=f"0 / {total}")
 
-        def worker():
-            total = len(self.files_data)
-            for i, obj in enumerate(self.files_data, start=1):
-                # estado "Analizando..." en la fila
-                self.after(0, lambda o=obj: o.get('lbl_fft') and o['lbl_fft'].configure(
-                    text="…", text_color="#38bdf8"))
-                try:
-                    result = self.perform_spectral_analysis(obj)
-                except subprocess.CalledProcessError:
-                    result = ("ffmpeg falló", "red")
-                except Exception as e:
-                    result = (f"Error: {type(e).__name__}", "red")
+        # Marcar todas las filas como "…"
+        for obj in items:
+            if obj.get('lbl_fft'):
+                obj['lbl_fft'].configure(text="…", text_color="#38bdf8")
 
-                text, color = result
-                obj['fft_result'] = result
-                # actualizar etiqueta de la fila (versión corta para la celda)
-                short = self._short_fft_label(text)
-                self.after(0, lambda o=obj, s=short, c=color: o.get('lbl_fft') and
-                           o['lbl_fft'].configure(text=s, text_color=c))
+        n_workers = min(_MAX_WORKERS, total)
+        executor = ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="fft")
 
-                self.after(0, lambda n=i: self.lbl_batch_status.configure(text=f"{n} / {total}"))
-            self.after(0, lambda: self.btn_batch_verify.configure(
-                state="normal", text="🔍 VERIFICAR TODOS (FFT)"))
-            self.after(0, lambda: self.lbl_batch_status.configure(text="Lote OK"))
+        # Contador de finalizados protegido con un Lock
+        done_count = [0]
+        done_lock = threading.Lock()
 
-        threading.Thread(target=worker, daemon=True).start()
+        def analyze_one(obj):
+            """Se ejecuta en un worker thread. Devuelve (obj, result)."""
+            try:
+                result = self.perform_spectral_analysis(obj)
+            except subprocess.CalledProcessError:
+                result = ("ffmpeg falló", "red")
+            except Exception as e:
+                result = (f"Error: {type(e).__name__}", "red")
+            return obj, result
+
+        def on_done(future):
+            """Callback cuando un future termina. Actualiza UI en el main thread."""
+            try:
+                obj, result = future.result()
+            except Exception:
+                return
+            text, color = result
+            obj['fft_result'] = result
+            short = self._short_fft_label(text)
+            self.after(0, lambda o=obj, s=short, c=color:
+                       o.get('lbl_fft') and o['lbl_fft'].configure(text=s, text_color=c))
+
+            with done_lock:
+                done_count[0] += 1
+                n = done_count[0]
+            self.after(0, lambda n=n: self.lbl_batch_status.configure(text=f"{n} / {total}"))
+
+        def coordinator():
+            """Lanza todas las tareas y espera a que terminen para restaurar el botón."""
+            try:
+                futures = [executor.submit(analyze_one, obj) for obj in items]
+                for fut in futures:
+                    fut.add_done_callback(on_done)
+                # Esperamos a todos antes de cerrar el executor
+                for fut in futures:
+                    try: fut.result()
+                    except Exception: pass
+            finally:
+                executor.shutdown(wait=False)
+                self.after(0, self._batch_finished)
+
+        threading.Thread(target=coordinator, daemon=True).start()
+
+    def _batch_finished(self):
+        """Restaura el botón y el estado cuando termina el lote FFT."""
+        self._batch_running = False
+        self.btn_batch_verify.configure(state="normal", text="🔍 VERIFICAR TODOS (FFT)")
+        self.lbl_batch_status.configure(text="Lote OK")
 
     @staticmethod
     def _short_fft_label(text):
